@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Velvet Silence — a museum heist</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; background: #070b14; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #wrap { width: 1280px; height: 720px; position: relative; }
+  canvas { display: block; width: 1280px; height: 720px; background: #0e1626; }
+  #note { position: absolute; left: 8px; bottom: 6px; color: #5b6b84; font: 11px/1.4 monospace; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1280" height="720"></canvas>
+  <div id="note">Velvet Silence — a silent museum heist. No network, no assets, just canvas.</div>
+</div>
+<script>
+'use strict';
+/* Velvet Silence — top-down stealth heist in one museum vault room.
+   Steal the 3 relics, reach the exit, never let the alarm hit 100%.
+   Pure canvas + WebAudio beeps. No network, no external assets. */
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = 1280, H = 720;
+
+/* ---------- palette ---------- */
+const C = {
+  bg: '#0e1626', floor: '#16233a', floor2: '#1a2942', wall: '#2a3a55',
+  wallTop: '#3b5178', sand: '#d9b380', sandDim: '#a98f66', teal: '#3fa796',
+  tealDim: '#2b7a6e', coral: '#ff6b5e', coralDim: '#c94f45',
+  pale: '#ffe9a8', guard: '#8fa3c4', guardDark: '#5d6f8f',
+  thief: '#1c2436', mask: '#f4f1e6', ink: '#e8ecf4', dim: '#8a97ad',
+  cone: 'rgba(255, 233, 168, 0.20)', coneEdge: 'rgba(255, 233, 168, 0.45)',
+  coneCam: 'rgba(120, 220, 200, 0.16)', coneCamEdge: 'rgba(120, 220, 200, 0.40)',
+  coneHot: 'rgba(255, 107, 94, 0.28)', coneHotEdge: 'rgba(255, 107, 94, 0.60)',
+};
+
+/* ---------- room geometry (canvas coords; HUD 0..54, footer 690..720) ---------- */
+const ROOM = { x: 40, y: 64, w: 1200, h: 612 }; // outer walls enclose this
+// Solid interior blocks (x, y, w, h). Walls block movement, sight and cones.
+const WALLS = [
+  { x: 40, y: 64, w: 1200, h: 12 },            // top wall
+  { x: 40, y: 664, w: 1200, h: 12 },           // bottom wall
+  { x: 40, y: 64, w: 12, h: 612 },             // left wall
+  { x: 1228, y: 64, w: 12, h: 612 },           // right wall
+  { x: 540, y: 64, w: 12, h: 96 },             // vault alcove, left cheek
+  { x: 728, y: 64, w: 12, h: 96 },             // vault alcove, right cheek
+  { x: 424, y: 372, w: 26, h: 26 },            // pillar west
+  { x: 830, y: 372, w: 26, h: 26 },            // pillar east
+  { x: 185, y: 285, w: 30, h: 30 },            // plinth west (relic stand)
+  { x: 1065, y: 285, w: 30, h: 30 },           // plinth east (relic stand)
+];
+// Hide zones: standing inside breaks line of sight and drops the alarm fast.
+const HIDES = [
+  { x: 292, y: 268, w: 108, h: 72, label: 'DISPLAY CASE' },
+  { x: 906, y: 246, w: 132, h: 112, label: 'CURTAIN' },
+  { x: 408, y: 588, w: 112, h: 76, label: 'SHADOW' },
+  { x: 748, y: 588, w: 112, h: 76, label: 'SHADOW' },
+  { x: 56, y: 556, w: 148, h: 104, label: 'ENTRY' },
+];
+// Loot: the three relics.
+const RELICS = [
+  { id: 0, x: 200, y: 300, name: 'Jade Scarab', taken: false },
+  { id: 1, x: 640, y: 122, name: 'Moon Opal', taken: false },
+  { id: 2, x: 1080, y: 300, name: 'Sun Idol', taken: false },
+];
+const EXIT = { x: 1116, y: 576, w: 96, h: 88 }; // exit corridor, bottom-right
+const SPAWN = { x: 120, y: 610 };
+
+/* ---------- game state ---------- */
+const G = {
+  state: 'title',        // title | play | paused | shot | won | lost
+  time: 0,               // seconds since heist start
+  alarm: 0,              // 0..100
+  lastSeenAt: -99,       // game time of last sighting
+  seenNow: false,        // any cone on the thief this tick
+  seenByCam: false,
+  lockdown: false,
+  lockdownT: 0,          // seconds left before the exit seals
+  loot: 0,
+  noise: 3,              // noisemakers left
+  muted: false,
+  loseReason: '',
+  winTime: 0,
+  msg: '', msgT: 0,      // floating hint line
+  shotName: '',
+  demo: false,
+  demoResult: '',
+  demoLog: [],
+};
+
+const player = {
+  x: SPAWN.x, y: SPAWN.y, r: 13, fx: 1, fy: 0, // facing
+  sneak: false, sprint: false, moving: false, hidden: true, speed: 0,
+};
+
+function mkGuard(waypoints, speed) {
+  return { wp: waypoints, wi: 0, x: waypoints[0].x, y: waypoints[0].y,
+    fx: 1, fy: 0, speed, wait: 0, mode: 'patrol', // patrol | investigate | hunt
+    invX: 0, invY: 0, invT: 0, r: 15, range: 175, half: 0.61 };
+}
+const guards = [
+  mkGuard([{ x: 480, y: 220 }, { x: 800, y: 220 }, { x: 800, y: 420 }, { x: 480, y: 420 }], 55),
+  mkGuard([{ x: 200, y: 380 }, { x: 700, y: 520 }, { x: 1100, y: 560 }, { x: 700, y: 300 }], 62),
+];
+function mkCam(x, y, base, amp, period) {
+  return { x, y, base, amp, period, t: 0, angle: base, range: 235, half: 0.49,
+    divertT: 0, divertX: 0, divertY: 0 };
+}
+const cams = [
+  mkCam(300, 78, Math.PI / 2, 0.95, 6.0),   // Camera A sweeps the left half
+  mkCam(980, 78, Math.PI / 2, 0.95, 7.3),   // Camera B sweeps the right half
+];
+const pings = [];   // noisemaker landing rings: {x, y, t}
+const parts = [];   // pickup sparkles: {x, y, vx, vy, t, col}
+
+/* ---------- input ---------- */
+const keys = {};
+let mouse = { x: 0, y: 0, clicked: false };
+addEventListener('keydown', (e) => {
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === ' ') keys[' '] = true;
+  if (e.key.toLowerCase() === 'm') G.muted = !G.muted;
+  if (e.key.toLowerCase() === 'r') resetGame();
+  if (e.key === 'Escape') {
+    if (G.state === 'play') G.state = 'paused';
+    else if (G.state === 'paused') G.state = 'play';
+  }
+  if (e.key === 'Enter' && G.state === 'title') { G.state = 'play'; beep(660, 0.08, 0.15); }
+  if (e.key.toLowerCase() === 'e' && G.state === 'play') tryGrab();
+});
+addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; if (e.key === ' ') keys[' '] = false; });
+cv.addEventListener('mousemove', (e) => {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (W / r.width);
+  mouse.y = (e.clientY - r.top) * (H / r.height);
+});
+cv.addEventListener('click', () => {
+  if (G.state === 'title') { G.state = 'play'; beep(660, 0.08, 0.15); return; }
+  if (G.state === 'play') throwNoise(mouse.x, mouse.y);
+});
+
+/* ---------- audio: WebAudio beeps only ---------- */
+let AC = null;
+function beep(freq, dur, vol) {
+  if (G.muted) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === 'suspended') AC.resume();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.12, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (_) { /* audio is decoration; never break the game */ }
+}
+let alarmTickT = 0;
+
+/* ---------- geometry helpers ---------- */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const angDiff = (a, b) => { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return Math.abs(d); };
+function inRect(x, y, r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+// Does segment (ax,ay)-(bx,by) cross rect r? (slab test)
+function segHitsRect(ax, ay, bx, by, r) {
+  const dx = bx - ax, dy = by - ay;
+  let t0 = 0, t1 = 1;
+  for (const [p, q] of [[-dx, ax - r.x], [dx, r.x + r.w - ax], [-dy, ay - r.y], [dy, r.y + r.h - ay]]) {
+    if (p === 0) { if (q < 0) return false; }
+    else { const t = q / p; if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; } }
+  }
+  return true;
+}
+function losClear(ax, ay, bx, by) {
+  for (const w of WALLS) if (segHitsRect(ax, ay, bx, by, w)) return false;
+  return true;
+}
+function circleHitsWall(x, y, r) {
+  for (const w of WALLS) {
+    const nx = clamp(x, w.x, w.x + w.w), ny = clamp(y, w.y, w.y + w.h);
+    if (dist(x, y, nx, ny) < r) return true;
+  }
+  return false;
+}
+function moveCircle(e, dx, dy) {
+  const nx = clamp(e.x + dx, ROOM.x + 14 + e.r, ROOM.x + ROOM.w - 14 - e.r);
+  if (!circleHitsWall(nx, e.y, e.r)) e.x = nx;
+  const ny = clamp(e.y + dy, ROOM.y + 14 + e.r, ROOM.y + ROOM.h - 14 - e.r);
+  if (!circleHitsWall(e.x, ny, e.r)) e.y = ny;
+}
+function inHide(x, y) { for (const h of HIDES) if (inRect(x, y, h)) return h; return null; }
+
+/* ---------- actions ---------- */
+function hint(text, secs) { G.msg = text; G.msgT = secs || 2.5; }
+function tryGrab() {
+  for (const relic of RELICS) {
+    if (!relic.taken && dist(player.x, player.y, relic.x, relic.y) < 46) {
+      relic.taken = true; G.loot++;
+      for (let i = 0; i < 14; i++) parts.push({ x: relic.x, y: relic.y,
+        vx: (Math.random() - 0.5) * 120, vy: (Math.random() - 0.5) * 120, t: 0, col: C.coral });
+      beep(880, 0.09, 0.15); setTimeout(() => beep(1320, 0.12, 0.12), 90);
+      hint('Relic taken: ' + relic.name + '  (' + G.loot + '/3)');
+      if (G.loot === 3) hint('All 3 relics! Reach the EXIT, bottom-right.', 4);
+      return;
+    }
+  }
+  hint('No relic in reach — stand close and press E.');
+}
+function throwNoise(tx, ty) {
+  if (G.noise <= 0) { hint('No noisemakers left.'); return; }
+  G.noise--;
+  const d = dist(player.x, player.y, tx, ty);
+  const range = 260;
+  const k = d > range ? range / d : 1;
+  const lx = player.x + (tx - player.x) * k, ly = player.y + (ty - player.y) * k;
+  pings.push({ x: lx, y: ly, t: 0 });
+  beep(220, 0.15, 0.18); setTimeout(() => beep(1760, 0.06, 0.10), 350);
+  hint('Noisemaker thrown — guards investigate the sound.');
+  for (const g of guards) {
+    if (dist(g.x, g.y, lx, ly) < 300) { g.mode = 'investigate'; g.invX = lx; g.invY = ly; g.invT = 4; }
+  }
+  let best = null, bd = 1e9;
+  for (const c of cams) { const dd = dist(c.x, c.y, lx, ly); if (dd < bd) { bd = dd; best = c; } }
+  if (best && bd < 520) { best.divertT = 4; best.divertX = lx; best.divertY = ly; }
+}
+function resetGame() {
+  G.state = G.demo ? 'play' : 'title';
+  G.time = 0; G.alarm = 0; G.lastSeenAt = -99; G.seenNow = false; G.seenByCam = false;
+  G.lockdown = false; G.lockdownT = 0; G.loot = 0; G.noise = 3; G.loseReason = '';
+  G.msg = ''; G.msgT = 0;
+  player.x = SPAWN.x; player.y = SPAWN.y; player.fx = 1; player.fy = 0; player.hidden = true;
+  for (const r of RELICS) r.taken = false;
+  guards[0].x = 480; guards[0].y = 220; guards[0].wi = 0; guards[0].mode = 'patrol';
+  guards[1].x = 200; guards[1].y = 380; guards[1].wi = 0; guards[1].mode = 'patrol';
+  for (const c of cams) { c.t = 0; c.divertT = 0; }
+  pings.length = 0; parts.length = 0;
+}
+
+/* ---------- detection ---------- */
+// Returns 0..1 sighting strength of watcher w on the thief (0 = unseen).
+function sight(w, isCam) {
+  const d = dist(w.x, w.y, player.x, player.y);
+  if (d > w.range) return 0;
+  const a = Math.atan2(player.y - w.y, player.x - w.x);
+  const fa = Math.atan2(w.fy, w.fx);
+  const off = angDiff(a, fa);
+  if (off > w.half) return 0;
+  if (!losClear(w.x, w.y, player.x, player.y)) return 0;
+  const centre = 1 - (off / w.half) * 0.6;      // dead-centre is worst
+  const near = 1 - (d / w.range) * 0.3;         // closer is worse
+  return clamp(centre * near, 0.15, 1);
+}
+
+/* ---------- per-tick update ---------- */
+function update(dt) {
+  G.time += dt;
+  if (G.msgT > 0) G.msgT -= dt;
+
+  // --- player movement ---
+  let ix = 0, iy = 0;
+  if (keys['w'] || keys['arrowup']) iy -= 1;
+  if (keys['s'] || keys['arrowdown']) iy += 1;
+  if (keys['a'] || keys['arrowleft']) ix -= 1;
+  if (keys['d'] || keys['arrowright']) ix += 1;
+  player.sneak = !!keys['shift'];
+  // Sprint is hold-X: fast (250) but loud — cones fill the alarm quicker.
+  player.sprint = !player.sneak && !!keys['x'];
+  const spd = player.sneak ? 90 : player.sprint ? 250 : 170;
+  player.speed = spd;
+  if (ix || iy) {
+    const len = Math.hypot(ix, iy); ix /= len; iy /= len;
+    player.fx = ix; player.fy = iy; player.moving = true;
+    moveCircle(player, ix * spd * dt, iy * spd * dt);
+  } else player.moving = false;
+  if (keys[' '] && !G._spaceDown) { // SPACE throws forward
+    throwNoise(player.x + player.fx * 130, player.y + player.fy * 130);
+  }
+  G._spaceDown = !!keys[' '];
+
+  // --- hiding ---
+  const hz = inHide(player.x, player.y);
+  player.hidden = !!hz;
+
+  // --- cameras sweep / divert ---
+  for (const c of cams) {
+    c.t += dt;
+    if (c.divertT > 0) {
+      c.divertT -= dt;
+      c.angle = Math.atan2(c.divertY - c.y, c.divertX - c.x);
+    } else {
+      c.angle = c.base + Math.sin((c.t / c.period) * Math.PI * 2) * c.amp;
+    }
+    c.fx = Math.cos(c.angle); c.fy = Math.sin(c.angle);
+  }
+
+  // --- guards: patrol / investigate / hunt ---
+  for (const g of guards) {
+    const speed = G.lockdown ? 98 : g.speed;
+    if (g.mode === 'investigate') {
+      g.invT -= dt;
+      const d = dist(g.x, g.y, g.invX, g.invY);
+      if (d > 8) {
+        const a = Math.atan2(g.invY - g.y, g.invX - g.x);
+        g.fx = Math.cos(a); g.fy = Math.sin(a);
+        moveCircle(g, g.fx * speed * dt, g.fy * speed * dt);
+      } else if (g.invT <= 0) g.mode = 'patrol';
+      continue;
+    }
+    if (g.mode === 'hunt' && G.lockdown) {
+      const tx = G.lastSeenX ?? player.x, ty = G.lastSeenY ?? player.y;
+      const d = dist(g.x, g.y, tx, ty);
+      if (d > 10) {
+        const a = Math.atan2(ty - g.y, tx - g.x);
+        g.fx = Math.cos(a); g.fy = Math.sin(a);
+        moveCircle(g, g.fx * speed * dt, g.fy * speed * dt);
+      }
+      continue;
+    }
+    const t = g.wp[g.wi];
+    const d = dist(g.x, g.y, t.x, t.y);
+    if (d < 10) { g.wi = (g.wi + 1) % g.wp.length; g.wait = 0.9; }
+    else if (g.wait > 0) { g.wait -= dt; }
+    else {
+      const a = Math.atan2(t.y - g.y, t.x - g.x);
+      g.fx = Math.cos(a); g.fy = Math.sin(a);
+      moveCircle(g, g.fx * speed * dt, g.fy * speed * dt);
+    }
+  }
+
+  // --- detection + alarm ---
+  G.seenNow = false; G.seenByCam = false;
+  let rate = 0, freshCam = false;
+  if (!player.hidden) {
+    for (const g of guards) {
+      const s = sight(g, false);
+      if (s > 0) { G.seenNow = true; rate = Math.max(rate, 26 * s * (player.sprint ? 1.6 : 1)); }
+    }
+    for (const c of cams) {
+      const s = sight(c, true);
+      if (s > 0) {
+        G.seenNow = true; G.seenByCam = true;
+        rate = Math.max(rate, 15 * s * (player.sprint ? 1.4 : 1));
+        if (!c._wasSeeing) freshCam = true; // camera just spotted the thief
+        c._wasSeeing = true;
+      } else c._wasSeeing = false;
+    }
+  } else {
+    for (const c of cams) c._wasSeeing = false;
+  }
+  if (G.seenNow) {
+    G.lastSeenAt = G.time;
+    G.lastSeenX = player.x; G.lastSeenY = player.y;
+    if (freshCam) G.alarm = Math.min(100, G.alarm + 8);
+    G.alarm = Math.min(100, G.alarm + rate * dt);
+    alarmTickT -= dt;
+    if (alarmTickT <= 0) { beep(520, 0.05, 0.08); alarmTickT = 0.45; }
+  } else if (G.time - G.lastSeenAt > 3) {
+    const decay = player.hidden ? 30 : player.sneak ? 20 : 12;
+    G.alarm = Math.max(0, G.alarm - decay * dt);
+  }
+
+  // --- lockdown ---
+  if (G.alarm >= 100 && !G.lockdown) {
+    G.lockdown = true; G.lockdownT = 8;
+    for (const g of guards) g.mode = 'hunt';
+    beep(180, 0.5, 0.2); setTimeout(() => beep(180, 0.5, 0.2), 550);
+    hint('LOCKDOWN! Exit seals in 8s — run!', 4);
+  }
+  if (G.lockdown) {
+    G.lockdownT -= dt;
+    if (G.lockdownT <= 0) { lose('The exit sealed. Lockdown wins.'); return; }
+  }
+
+  // --- caught? ---
+  for (const g of guards) {
+    if (dist(g.x, g.y, player.x, player.y) < g.r + player.r - 2) {
+      lose('Caught by a guard.'); return;
+    }
+  }
+
+  // --- win? ---
+  if (G.loot === 3 && inRect(player.x, player.y, EXIT)) { win(); return; }
+  if (G.loot < 3 && inRect(player.x, player.y, EXIT)) {
+    if (!G._exitHint || G.time - G._exitHint > 4) {
+      hint('Exit locked — steal all 3 relics first (' + G.loot + '/3).');
+      G._exitHint = G.time;
+    }
+  }
+
+  // --- particles / pings age ---
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.t > 0.7) parts.splice(i, 1);
+  }
+  for (let i = pings.length - 1; i >= 0; i--) {
+    pings[i].t += dt;
+    if (pings[i].t > 1.6) pings.splice(i, 1);
+  }
+}
+
+function win() {
+  G.state = 'won'; G.winTime = G.time;
+  beep(660, 0.12, 0.15); setTimeout(() => beep(880, 0.12, 0.15), 130);
+  setTimeout(() => beep(1320, 0.25, 0.15), 280);
+  if (G.demo) { G.demoResult = 'won'; document.title = 'DEMO WON ' + G.time.toFixed(1) + 's'; }
+}
+function lose(reason) {
+  G.state = 'lost'; G.loseReason = reason;
+  beep(160, 0.4, 0.18); setTimeout(() => beep(110, 0.6, 0.15), 200);
+  if (G.demo) { G.demoResult = 'lost:' + reason; document.title = 'DEMO LOST ' + reason; }
+}
+
+/* ---------- demo autopilot: spawn -> 3 relics -> exit ---------- */
+const DEMO_ROUTE = [
+  { x: 200, y: 300, grab: true },   // Jade Scarab, west plinth
+  { x: 640, y: 122, grab: true },   // Moon Opal, vault alcove
+  { x: 1080, y: 300, grab: true },  // Sun Idol, east nook
+  { x: 1160, y: 618, grab: false }, // exit corridor
+];
+let demoStep = 0;
+function demoDrive(dt) {
+  if (G.state !== 'play') return;
+  const target = DEMO_ROUTE[demoStep];
+  if (!target) return;
+  // Alarm hot: fall back to the nearest hide and wait it out.
+  if (G.alarm > 70 && !player.hidden) {
+    let best = null, bd = 1e9;
+    for (const h of HIDES) {
+      const d = dist(player.x, player.y, h.x + h.w / 2, h.y + h.h / 2);
+      if (d < bd) { bd = d; best = h; }
+    }
+    const cx = best.x + best.w / 2, cy = best.y + best.h / 2;
+    stepToward(cx, cy, 90, dt, true);
+    return;
+  }
+  if (G.alarm > 55 && player.hidden) return; // wait in cover until cooler
+  // Spotted: crouch and slip sideways out of the cone, away from the watcher.
+  if (G.seenNow) {
+    let wx = 0, wy = 0;
+    for (const g of guards) if (sight(g, false) > 0) { wx = g.x; wy = g.y; }
+    for (const c of cams) if (sight(c, true) > 0) { wx = c.x; wy = c.y; }
+    const a = Math.atan2(player.y - wy, player.x - wx) + Math.PI / 2; // perpendicular
+    stepToward(player.x + Math.cos(a) * 60, player.y + Math.sin(a) * 60, 90, dt, true);
+    return;
+  }
+  const d = dist(player.x, player.y, target.x, target.y);
+  if (target.grab && d < 40) { tryGrab(); demoStep++; return; }
+  if (!target.grab && d < 24) return; // exit step: update() wins on arrival
+  stepToward(target.x, target.y, 170, dt, false);
+}
+function stepToward(tx, ty, spd, dt, sneak) {
+  const a = Math.atan2(ty - player.y, tx - player.x);
+  player.fx = Math.cos(a); player.fy = Math.sin(a);
+  player.sneak = sneak; player.sprint = false; player.moving = true;
+  moveCircle(player, Math.cos(a) * spd * dt, Math.sin(a) * spd * dt);
+}
+
+/* ---------- rendering ---------- */
+function conePath(x, y, ang, half, range) {
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.arc(x, y, range, ang - half, ang + half); ctx.closePath();
+}
+function drawCone(x, y, ang, half, range, hot, cam) {
+  ctx.fillStyle = hot ? C.coneHot : cam ? C.coneCam : C.cone;
+  conePath(x, y, ang, half, range); ctx.fill();
+  ctx.strokeStyle = hot ? C.coneHotEdge : cam ? C.coneCamEdge : C.coneEdge;
+  ctx.lineWidth = 1.5; ctx.stroke();
+}
+function drawDiamond(x, y, r, col) {
+  ctx.beginPath(); ctx.moveTo(x, y - r); ctx.lineTo(x + r * 0.7, y);
+  ctx.lineTo(x, y + r); ctx.lineTo(x - r * 0.7, y); ctx.closePath();
+  ctx.fillStyle = col; ctx.fill();
+}
+function drawStar(x, y, r, col) {
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2 - Math.PI / 2, rr = i % 2 ? r * 0.45 : r;
+    ctx[i ? 'lineTo' : 'moveTo'](x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+  }
+  ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function fmtTime(s) {
+  const m = Math.floor(s / 60), ss = Math.floor(s % 60);
+  return m + ':' + String(ss).padStart(2, '0');
+}
+function statusText() {
+  if (G.seenNow) return ['SPOTTED!', '#ff6b5e'];
+  if (player.hidden) return ['HIDDEN', '#3fa796'];
+  if (G.alarm >= 30 || G.time - G.lastSeenAt < 3) return ['SUSPICIOUS', '#ffb648'];
+  return ['CLEAR', '#8fa3c4'];
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+
+  /* ----- HUD bar ----- */
+  ctx.fillStyle = '#0a1220'; ctx.fillRect(0, 0, W, 54);
+  ctx.fillStyle = C.wallTop; ctx.fillRect(0, 54, W, 2);
+  ctx.fillStyle = C.ink; ctx.font = 'bold 20px Georgia, serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText('VELVET SILENCE', 16, 28);
+  ctx.fillStyle = C.dim; ctx.font = '13px system-ui, sans-serif';
+  ctx.fillText('Steal 3 relics, reach the exit — stay out of the light.', 218, 29);
+  // status pill
+  const [st, scol] = statusText();
+  ctx.font = 'bold 13px system-ui, sans-serif';
+  const pw = ctx.measureText(st).width + 22;
+  const px = 640;
+  ctx.fillStyle = scol; roundRect(px, 14, pw, 26, 13); ctx.fill();
+  ctx.fillStyle = '#0e1626'; ctx.fillText(st, px + 11, 28);
+  // alarm meter
+  const ax = 800, ay = 16, aw = 190, ah = 22;
+  ctx.fillStyle = '#1a2942'; roundRect(ax, ay, aw, ah, 5); ctx.fill();
+  const af = clamp(G.alarm / 100, 0, 1);
+  ctx.fillStyle = G.lockdown ? C.coral : af > 0.6 ? '#ffb648' : C.teal;
+  if (af > 0) { roundRect(ax + 2, ay + 2, (aw - 4) * af, ah - 4, 4); ctx.fill(); }
+  ctx.strokeStyle = G.lockdown ? C.coral : '#3b5178'; ctx.lineWidth = 1.5;
+  roundRect(ax, ay, aw, ah, 5); ctx.stroke();
+  ctx.fillStyle = C.ink; ctx.font = 'bold 12px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('ALARM ' + Math.round(G.alarm) + '%', ax + 6, ay + ah / 2 + 0.5);
+  // loot / noise / timer
+  ctx.fillStyle = C.coral; ctx.font = 'bold 15px system-ui, sans-serif';
+  ctx.fillText('◆ ' + G.loot + '/3', 1010, 28);
+  ctx.fillStyle = C.teal;
+  ctx.fillText('◉ ×' + G.noise, 1075, 28);
+  ctx.fillStyle = C.ink;
+  ctx.fillText('◷ ' + fmtTime(G.time), 1150, 28);
+  if (G.lockdown) {
+    ctx.fillStyle = C.coral; ctx.font = 'bold 13px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('LOCKDOWN — EXIT SEALS IN ' + Math.ceil(G.lockdownT) + 's', 640, 46);
+    ctx.textAlign = 'left';
+  }
+
+  /* ----- floor ----- */
+  ctx.fillStyle = C.floor; ctx.fillRect(ROOM.x, ROOM.y, ROOM.w, ROOM.h);
+  ctx.strokeStyle = C.floor2; ctx.lineWidth = 1;
+  for (let x = ROOM.x + 60; x < ROOM.x + ROOM.w; x += 60) {
+    ctx.beginPath(); ctx.moveTo(x, ROOM.y); ctx.lineTo(x, ROOM.y + ROOM.h); ctx.stroke();
+  }
+  for (let y = ROOM.y + 60; y < ROOM.y + ROOM.h; y += 60) {
+    ctx.beginPath(); ctx.moveTo(ROOM.x, y); ctx.lineTo(ROOM.x + ROOM.w, y); ctx.stroke();
+  }
+  // carpet runner down the middle
+  ctx.fillStyle = 'rgba(217, 179, 128, 0.07)';
+  ctx.fillRect(600, ROOM.y, 80, ROOM.h);
+
+  /* ----- hide zones ----- */
+  for (const h of HIDES) {
+    ctx.fillStyle = 'rgba(63, 167, 150, 0.10)';
+    ctx.fillRect(h.x, h.y, h.w, h.h);
+    ctx.strokeStyle = 'rgba(63, 167, 150, 0.55)'; ctx.setLineDash([6, 5]); ctx.lineWidth = 1.5;
+    ctx.strokeRect(h.x, h.y, h.w, h.h); ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(63, 167, 150, 0.85)'; ctx.font = '10px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('HIDE · ' + h.label, h.x + h.w / 2, h.y + h.h - 8);
+    ctx.textAlign = 'left';
+  }
+
+  /* ----- exit corridor ----- */
+  const exitOpen = G.loot === 3;
+  ctx.fillStyle = exitOpen ? 'rgba(63, 167, 150, 0.25)' : 'rgba(255, 107, 94, 0.12)';
+  ctx.fillRect(EXIT.x, EXIT.y, EXIT.w, EXIT.h);
+  ctx.strokeStyle = exitOpen ? C.teal : C.coral; ctx.lineWidth = 2;
+  ctx.strokeRect(EXIT.x, EXIT.y, EXIT.w, EXIT.h);
+  ctx.fillStyle = exitOpen ? C.teal : C.coral; ctx.font = 'bold 15px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(exitOpen ? 'EXIT →' : 'EXIT · ' + G.loot + '/3', EXIT.x + EXIT.w / 2, EXIT.y + EXIT.h / 2);
+  ctx.textAlign = 'left';
+
+  /* ----- walls ----- */
+  for (const w of WALLS) {
+    ctx.fillStyle = C.wall; ctx.fillRect(w.x, w.y, w.w, w.h);
+    ctx.fillStyle = C.wallTop; ctx.fillRect(w.x, w.y, w.w, 3);
+  }
+  // vault alcove label
+  ctx.fillStyle = C.sandDim; ctx.font = 'bold 11px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('V A U L T', 640, 88);
+  ctx.textAlign = 'left';
+
+  /* ----- relic plinths + loot ----- */
+  for (const r of RELICS) {
+    ctx.fillStyle = C.sand; ctx.fillRect(r.x - 22, r.y - 6, 44, 14);
+    ctx.fillStyle = C.sandDim; ctx.fillRect(r.x - 22, r.y + 8, 44, 3);
+    if (!r.taken) {
+      const pulse = 1 + Math.sin(G.time * 3 + r.id * 2) * 0.12;
+      ctx.save(); ctx.globalAlpha = 0.25;
+      drawDiamond(r.x, r.y - 18, 26 * pulse, C.coral); ctx.restore();
+      drawDiamond(r.x, r.y - 18, 11 * pulse, C.coral);
+      ctx.fillStyle = '#fff'; ctx.beginPath();
+      ctx.arc(r.x - 3, r.y - 21, 2, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = C.coral; ctx.font = 'bold 10px system-ui, sans-serif';
+      ctx.textAlign = 'center'; ctx.fillText(r.name.toUpperCase(), r.x, r.y + 26);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  /* ----- vision cones (under the watchers) ----- */
+  for (const c of cams) drawCone(c.x, c.y, c.angle, c.half, c.range, G.lockdown, true);
+  for (const g of guards) {
+    const a = Math.atan2(g.fy, g.fx);
+    drawCone(g.x, g.y, a, g.half, g.range, G.lockdown, false);
+  }
+
+  /* ----- cameras ----- */
+  for (const c of cams) {
+    ctx.fillStyle = C.teal;
+    ctx.beginPath();
+    ctx.moveTo(c.x - 12, c.y - 4); ctx.lineTo(c.x + 12, c.y - 4);
+    ctx.lineTo(c.x + 7, c.y + 10); ctx.lineTo(c.x - 7, c.y + 10);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = G.lockdown ? C.coral : '#bff5e8';
+    ctx.beginPath(); ctx.arc(c.x, c.y + 3, 3, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = C.dim; ctx.font = '10px system-ui, sans-serif';
+  ctx.fillText('CAM A', 282, 100); ctx.fillText('CAM B', 962, 100);
+
+  /* ----- guards ----- */
+  for (const g of guards) {
+    ctx.fillStyle = g.mode === 'hunt' ? C.coralDim : C.guard;
+    ctx.beginPath(); ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = C.guardDark;
+    ctx.beginPath(); ctx.arc(g.x, g.y, g.r - 5, 0, Math.PI * 2); ctx.fill();
+    // facing tick + eyes
+    const a = Math.atan2(g.fy, g.fx);
+    ctx.strokeStyle = '#e8ecf4'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(g.x, g.y);
+    ctx.lineTo(g.x + Math.cos(a) * (g.r + 5), g.y + Math.sin(a) * (g.r + 5)); ctx.stroke();
+    ctx.fillStyle = '#e8ecf4';
+    ctx.beginPath(); ctx.arc(g.x + Math.cos(a - 0.5) * 6, g.y + Math.sin(a - 0.5) * 6, 2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(g.x + Math.cos(a + 0.5) * 6, g.y + Math.sin(a + 0.5) * 6, 2, 0, Math.PI * 2); ctx.fill();
+    if (g.mode !== 'patrol') {
+      ctx.fillStyle = '#ffb648'; ctx.font = 'bold 11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(g.mode === 'hunt' ? '!' : '?', g.x, g.y - g.r - 8);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  /* ----- noisemaker pings ----- */
+  for (const p of pings) {
+    ctx.strokeStyle = 'rgba(255, 233, 168,' + (1 - p.t / 1.6).toFixed(2) + ')';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 8 + p.t * 90, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = C.pale; ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+  }
+
+  /* ----- thief ----- */
+  const bob = player.moving ? Math.sin(G.time * 10) * 1.5 : 0;
+  ctx.save(); ctx.translate(player.x, player.y + bob * 0.3);
+  ctx.rotate(Math.atan2(player.fy, player.fx));
+  ctx.fillStyle = player.hidden ? '#232f47' : '#31406a';
+  ctx.beginPath(); ctx.moveTo(16, 0); ctx.lineTo(0, 11); ctx.lineTo(-14, 0); ctx.lineTo(0, -11);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(232, 236, 244, 0.9)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.strokeStyle = C.mask; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(5, -7); ctx.lineTo(5, 7); ctx.stroke();
+  ctx.restore();
+  // sneak ring
+  if (player.sneak) {
+    ctx.strokeStyle = 'rgba(63, 167, 150, 0.8)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(player.x, player.y, player.r + 5, 0, Math.PI * 2); ctx.stroke();
+  }
+  // sparkles
+  for (const p of parts) {
+    ctx.fillStyle = p.col; ctx.globalAlpha = 1 - p.t / 0.7;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ----- floating hint ----- */
+  if (G.msgT > 0) {
+    ctx.fillStyle = 'rgba(10, 18, 32, 0.85)';
+    ctx.font = '13px system-ui, sans-serif';
+    const mw = ctx.measureText(G.msg).width + 24;
+    roundRect(640 - mw / 2, 660, mw, 26, 6); ctx.fill();
+    ctx.fillStyle = C.pale; ctx.textAlign = 'center';
+    ctx.fillText(G.msg, 640, 674); ctx.textAlign = 'left';
+  }
+
+  /* ----- footer: legend + controls ----- */
+  ctx.fillStyle = '#0a1220'; ctx.fillRect(0, 690, W, 30);
+  ctx.fillStyle = C.wallTop; ctx.fillRect(0, 690, W, 1);
+  ctx.fillStyle = C.dim; ctx.font = '12px system-ui, sans-serif';
+  ctx.fillText('WASD/arrows move · SHIFT sneak · X sprint (loud) · CLICK/SPACE noisemaker · E grab · R retry · M mute · ESC pause', 20, 709);
+  ctx.fillStyle = C.pale; ctx.fillText('▨ guard cone', 1010, 709);
+  ctx.fillStyle = C.teal; ctx.fillText('▨ camera cone', 1110, 709);
+
+  /* ----- overlays ----- */
+  if (G.state === 'title') {
+    ctx.fillStyle = 'rgba(7, 11, 20, 0.78)'; ctx.fillRect(0, 54, W, 636);
+    ctx.fillStyle = C.ink; ctx.textAlign = 'center';
+    ctx.font = 'bold 54px Georgia, serif';
+    ctx.fillText('VELVET SILENCE', 640, 250);
+    ctx.fillStyle = C.sand; ctx.font = '17px Georgia, serif';
+    ctx.fillText('One thief. Three relics. One very awake museum.', 640, 292);
+    ctx.fillStyle = C.dim; ctx.font = '15px system-ui, sans-serif';
+    ctx.fillText('Slip past the guards and the sweeping cameras. Hide in the display case,', 640, 340);
+    ctx.fillText('the curtain and the shadows. Grab all 3 relics, then run for the exit.', 640, 364);
+    ctx.fillStyle = C.coral; ctx.font = 'bold 15px system-ui, sans-serif';
+    ctx.fillText('If the alarm hits 100%, the exit seals in 8 seconds.', 640, 398);
+    ctx.fillStyle = C.ink; ctx.font = 'bold 18px system-ui, sans-serif';
+    ctx.fillText('— click or press ENTER to begin —', 640, 450);
+    ctx.textAlign = 'left';
+  } else if (G.state === 'paused') {
+    ctx.fillStyle = 'rgba(7, 11, 20, 0.7)'; ctx.fillRect(0, 54, W, 636);
+    ctx.fillStyle = C.ink; ctx.textAlign = 'center';
+    ctx.font = 'bold 40px Georgia, serif'; ctx.fillText('PAUSED', 640, 360);
+    ctx.font = '15px system-ui, sans-serif'; ctx.fillStyle = C.dim;
+    ctx.fillText('ESC to resume · R to restart the heist', 640, 396);
+    ctx.textAlign = 'left';
+  } else if (G.state === 'won') {
+    ctx.fillStyle = 'rgba(7, 11, 20, 0.72)'; ctx.fillRect(0, 54, W, 636);
+    ctx.fillStyle = C.teal; ctx.textAlign = 'center';
+    ctx.font = 'bold 48px Georgia, serif'; ctx.fillText('CLEAN GETAWAY', 640, 320);
+    ctx.fillStyle = C.ink; ctx.font = '18px system-ui, sans-serif';
+    ctx.fillText('All 3 relics, out in ' + fmtTime(G.winTime) + ' — the museum never knew.', 640, 362);
+    ctx.fillStyle = C.dim; ctx.font = '15px system-ui, sans-serif';
+    ctx.fillText('Press R to run it again.', 640, 396);
+    ctx.textAlign = 'left';
+  } else if (G.state === 'lost') {
+    ctx.fillStyle = 'rgba(7, 11, 20, 0.78)'; ctx.fillRect(0, 54, W, 636);
+    ctx.fillStyle = C.coral; ctx.textAlign = 'center';
+    ctx.font = 'bold 48px Georgia, serif'; ctx.fillText('BUSTED', 640, 320);
+    ctx.fillStyle = C.ink; ctx.font = '18px system-ui, sans-serif';
+    ctx.fillText(G.loseReason, 640, 362);
+    ctx.fillStyle = C.dim; ctx.font = '15px system-ui, sans-serif';
+    ctx.fillText('Press R to try again.', 640, 396);
+    ctx.textAlign = 'left';
+  }
+}
+
+/* ---------- deterministic ?shot= states (frozen tableaus) ---------- */
+function applyShot(name) {
+  G.shotName = name; G.state = 'shot'; G.demo = false;
+  resetGame(); G.state = 'shot';
+  G.time = name === 'start' ? 0 : name === 'suspicious' ? 41 : name === 'hidden' ? 68 : 122;
+  if (name === 'start') {
+    player.x = 120; player.y = 610; player.hidden = true; G.alarm = 12;
+    guards[0].x = 560; guards[0].y = 220; guards[0].fx = 0.7; guards[0].fy = 0.7;
+    guards[1].x = 700; guards[1].y = 520; guards[1].fx = -0.9; guards[1].fy = -0.4;
+    cams[0].angle = Math.PI / 2 - 0.7; cams[1].angle = Math.PI / 2 + 0.7;
+    cams[0].fx = Math.cos(cams[0].angle); cams[0].fy = Math.sin(cams[0].angle);
+    cams[1].fx = Math.cos(cams[1].angle); cams[1].fy = Math.sin(cams[1].angle);
+  } else if (name === 'suspicious') {
+    RELICS[0].taken = true; G.loot = 1;
+    player.x = 268; player.y = 302; player.fx = 1; player.fy = 0; player.hidden = false;
+    G.alarm = 55; G.lastSeenAt = G.time - 1;
+    guards[0].x = 480; guards[0].y = 300; guards[0].fx = -1; guards[0].fy = 0;
+    guards[1].x = 700; guards[1].y = 520; guards[1].fx = 0.4; guards[1].fy = -0.9;
+    cams[0].angle = Math.PI / 2 + 0.5; cams[1].angle = Math.PI / 2 - 0.4;
+    cams[0].fx = Math.cos(cams[0].angle); cams[0].fy = Math.sin(cams[0].angle);
+    cams[1].fx = Math.cos(cams[1].angle); cams[1].fy = Math.sin(cams[1].angle);
+    G.seenNow = true;
+  } else if (name === 'hidden') {
+    RELICS[0].taken = true; G.loot = 1;
+    player.x = 346; player.y = 304; player.fx = 1; player.fy = 0; player.hidden = true;
+    player.sneak = true; G.alarm = 30; G.lastSeenAt = G.time - 6;
+    guards[0].x = 480; guards[0].y = 282; guards[0].fx = -1; guards[0].fy = 0.1;
+    guards[1].x = 900; guards[1].y = 480; guards[1].fx = -0.7; guards[1].fy = -0.7;
+    cams[0].angle = Math.PI / 2 - 0.2; cams[1].angle = Math.PI / 2 + 0.9;
+    cams[0].fx = Math.cos(cams[0].angle); cams[0].fy = Math.sin(cams[0].angle);
+    cams[1].fx = Math.cos(cams[1].angle); cams[1].fy = Math.sin(cams[1].angle);
+  } else if (name === 'exit') {
+    RELICS[0].taken = true; RELICS[1].taken = true; RELICS[2].taken = true; G.loot = 3;
+    player.x = 1118; player.y = 606; player.fx = 1; player.fy = 0; player.hidden = false;
+    G.alarm = 82; G.lastSeenAt = G.time - 0.5; G.seenNow = true;
+    guards[0].x = 800; guards[0].y = 420; guards[0].fx = 0.8; guards[0].fy = 0.6;
+    guards[1].x = 990; guards[1].y = 540; guards[1].fx = 0.9; guards[1].fy = 0.4;
+    cams[0].angle = Math.PI / 2 + 0.6; cams[1].angle = Math.PI / 2 - 0.8;
+    cams[0].fx = Math.cos(cams[0].angle); cams[0].fy = Math.sin(cams[0].angle);
+    cams[1].fx = Math.cos(cams[1].angle); cams[1].fy = Math.sin(cams[1].angle);
+  }
+  render();
+  window.__shotReady = true;
+}
+
+/* ---------- test hooks (for headless playtests, not for players) ---------- */
+window.__game = {
+  G, player, guards, cams, RELICS,
+  teleport(x, y) { player.x = x; player.y = y; },
+  start() { G.state = 'play'; },
+  reset: resetGame,
+};
+
+/* ---------- boot ---------- */
+const params = new URLSearchParams(location.search);
+const shot = params.get('shot');
+if (shot) {
+  applyShot(shot);
+} else {
+  if (params.get('demo') === '1') {
+    G.demo = true; G.state = 'play'; demoStep = 0;
+    document.title = 'DEMO RUNNING';
+  }
+  let last = performance.now();
+  (function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (G.state === 'play') {
+      if (G.demo) demoDrive(dt);
+      update(dt);
+    }
+    render();
+    requestAnimationFrame(loop);
+  })(last);
+}
+</script>
+</body>
+</html>
